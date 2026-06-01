@@ -1,0 +1,14 @@
+# Comms
+pymavlink
+
+# Vision
+#cv2
+opencv-python
+numpy
+
+# Math / Spatial transforms
+scipy
+
+# Debug
+matplotlib
+keyboard
