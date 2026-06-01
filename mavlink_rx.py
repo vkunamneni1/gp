@@ -27,6 +27,9 @@ class MAVLinkRX:
         self.track_chunks = {}
         self.expected_num_track_chunks = {}
 
+        # Debug: track which message types we receive from the sim
+        self._seen_msg_types = set()
+
         # Initialize all data fields so the controller never gets KeyError
         self.data['armed'] = False
         self.data['attitude'] = {
@@ -112,6 +115,11 @@ class MAVLinkRX:
 
             if msg_type == "BAD_DATA":
                 continue
+
+            # Debug: log first occurrence of each message type
+            if msg_type not in self._seen_msg_types:
+                self._seen_msg_types.add(msg_type)
+                print(f"[MAVLINK] First received: {msg_type}", flush=True)
 
             # --------------------------------------------------------------------------------------
             # HEARTBEAT

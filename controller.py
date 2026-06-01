@@ -1,15 +1,16 @@
 """
 Autonomous Flight Controller for AI Grand Prix
 =================================================
-State-machine-based controller that navigates through race gates using:
-  1. Waypoint navigation (track data gate positions + local NED position)
-  2. Vision refinement (gate detector for precision approach)
-  3. Velocity-based control via SET_POSITION_TARGET_LOCAL_NED
+Vision-based navigation using attitude rate control.
+No dependency on position data — navigates purely from:
+  - FPV camera (gate detection)
+  - ATTITUDE telemetry (roll, pitch, yaw)
+  - Race status (active gate index)
 
-Control hierarchy:
-  IDLE → WAIT_FOR_DATA → TAKEOFF → NAVIGATE → FINISHED
+Control: SET_ATTITUDE_TARGET (body rates + thrust)
+Navigation: Pixel-error-based steering — like an FPV pilot.
 
-Focus: COURSE COMPLETION. Safe, reliable, gate-by-gate navigation.
+State machine: ARMED_WAIT → LIFTOFF → NAVIGATE → FINISHED
 """
 
 import time
@@ -22,89 +23,81 @@ from pymavlink import mavutil
 MAVLINK_CMD_SIM_RESET = 31000
 
 # --------------------------------------------------------------------------------------
-# Flight States
+# States
 # --------------------------------------------------------------------------------------
-STATE_IDLE            = "IDLE"
-STATE_WAIT_FOR_DATA   = "WAIT_FOR_DATA"
-STATE_TAKEOFF         = "TAKEOFF"
-STATE_NAVIGATE        = "NAVIGATE"
-STATE_RECOVER         = "RECOVER"
-STATE_FINISHED        = "FINISHED"
+STATE_ARMED_WAIT = "ARMED_WAIT"      # brief wait after arming
+STATE_LIFTOFF    = "LIFTOFF"         # timed ascent
+STATE_NAVIGATE   = "NAVIGATE"        # main flight
+STATE_FINISHED   = "FINISHED"        # race done
 
 # --------------------------------------------------------------------------------------
-# Tuning Parameters
+# Control Mode — switch if needed
+# "attitude" = SET_ATTITUDE_TARGET (body rates + thrust) — most reliable
+# "velocity" = SET_POSITION_TARGET_LOCAL_NED (velocity commands) — needs sim FC support
 # --------------------------------------------------------------------------------------
-CONTROL_HZ = 50           # 50 Hz control loop (well under 100 Hz limit)
-
-# Speed profile
-MAX_SPEED       = 6.0     # m/s — cruise speed (conservative for reliability)
-APPROACH_SPEED  = 3.5     # m/s — when getting close to gate
-PRECISION_SPEED = 2.5     # m/s — very close to gate, precision threading
-MIN_SPEED       = 1.5     # m/s — minimum forward speed
-
-# Distance thresholds
-FAR_DISTANCE       = 12.0   # > this = cruise speed
-APPROACH_DISTANCE  = 6.0    # < this = approach speed
-PRECISION_DISTANCE = 3.0    # < this = precision speed
-GATE_PASSED_DIST   = 1.5    # consider gate passed if within this distance
-
-# Takeoff
-TAKEOFF_ALT = -2.0        # NED: negative = up. 2m above ground.
-TAKEOFF_SPEED = 1.0       # m/s upward
-
-# Gate look-ahead: how far past the gate center to aim (to ensure clean pass-through)
-GATE_LOOKAHEAD = 2.5      # meters past gate center along gate normal
-
-# Vision blending
-VISION_BLEND_DISTANCE = 8.0    # start blending vision corrections within this distance
-VISION_WEIGHT_MAX     = 0.3    # max weight for vision corrections
-VISION_PIXEL_GAIN     = 0.003  # how much pixel error translates to velocity correction
-
-# Collision recovery
-RECOVERY_DURATION = 1.0   # seconds to back off after collision
-RECOVERY_SPEED    = -1.5  # back up slowly
-
-# Altitude tolerance
-ALT_TOLERANCE = 0.5       # meters
-
-
-def quat_to_yaw(qw, qx, qy, qz):
-    """Extract yaw angle from quaternion (NED convention)."""
-    siny = 2.0 * (qw * qz + qx * qy)
-    cosy = 1.0 - 2.0 * (qy * qy + qz * qz)
-    return math.atan2(siny, cosy)
-
-
-def quat_forward_vector(qw, qx, qy, qz):
-    """
-    Get the forward direction (through the gate) from gate orientation quaternion.
-    The gate's local forward is along its Z-axis (or X-axis depending on convention).
-    We compute both and pick the one that makes more sense.
-    """
-    # Rotate unit-X by the quaternion to get the gate's forward direction in NED
-    # Using quaternion rotation: v' = q * v * q_inv
-    # For efficiency, direct formula for rotating (1,0,0):
-    fx = 1.0 - 2.0*(qy*qy + qz*qz)
-    fy = 2.0*(qx*qy + qw*qz)
-    fz = 2.0*(qx*qz - qw*qy)
-    return np.array([fx, fy, fz])
-
-
-def normalize(v):
-    """Normalize a vector, return zero vector if magnitude is too small."""
-    n = np.linalg.norm(v)
-    if n < 1e-6:
-        return np.zeros_like(v)
-    return v / n
-
-
-def clamp(value, min_val, max_val):
-    return max(min_val, min(max_val, value))
-
+CONTROL_MODE = "attitude"
 
 # --------------------------------------------------------------------------------------
-# Velocity-based position target mask: use only velocity fields
+# Timing
 # --------------------------------------------------------------------------------------
+CONTROL_HZ = 50
+
+# Liftoff: duration in seconds to send upward commands
+LIFTOFF_DURATION = 2.5   # seconds of upward thrust before navigating
+ARMED_WAIT_TIME  = 1.5   # seconds to wait after arm command
+
+# --------------------------------------------------------------------------------------
+# Attitude Control Tuning
+# --------------------------------------------------------------------------------------
+HOVER_THRUST     = 0.52   # thrust for ~hover (adjust per drone weight)
+LIFTOFF_THRUST   = 0.70   # thrust during liftoff (more than hover to ascend)
+FORWARD_PITCH    = -0.12  # base forward pitch angle in radians (~7°)
+MAX_PITCH        = -0.30  # max forward pitch (~17°)
+MAX_ROLL         = 0.25   # max roll angle (~14°)
+
+# Outer-loop P gains: desired_angle → rate command
+KP_PITCH = 3.5
+KP_ROLL  = 3.5
+
+# --------------------------------------------------------------------------------------
+# Vision Steering Gains
+# --------------------------------------------------------------------------------------
+# Pixel error is in range roughly [-320, 320] horizontal, [-180, 180] vertical
+KP_YAW_PIXEL    = 0.004    # yaw rate per pixel of horizontal error
+KP_ROLL_PIXEL   = 0.0006   # desired roll angle per pixel of horizontal error
+KP_THRUST_PIXEL = 0.0006   # thrust adjustment per pixel of vertical error
+KP_PITCH_PIXEL  = 0.0002   # pitch adjustment per pixel of vertical error
+
+# --------------------------------------------------------------------------------------
+# Speed modulation (via pitch angle)
+# --------------------------------------------------------------------------------------
+# When gate is very close, reduce forward pitch to slow down
+SLOW_DOWN_DISTANCE = 4.0
+SLOW_DOWN_FACTOR   = 0.5
+
+# --------------------------------------------------------------------------------------
+# Search behavior (no gate visible)
+# --------------------------------------------------------------------------------------
+SEARCH_PITCH      = -0.08   # gentle forward pitch
+SEARCH_YAW_RATE   = 0.4     # yaw rate for searching (rad/s)
+SEARCH_THRUST     = 0.52
+NO_GATE_TIMEOUT   = 3.0     # after this many seconds with no gate, start searching
+
+# --------------------------------------------------------------------------------------
+# Velocity control tuning (if CONTROL_MODE = "velocity")
+# --------------------------------------------------------------------------------------
+CRUISE_SPEED    = 5.0   # m/s forward
+APPROACH_SPEED  = 3.0
+PRECISION_SPEED = 2.0
+SEARCH_SPEED    = 2.5
+
+# --------------------------------------------------------------------------------------
+# Masks
+# --------------------------------------------------------------------------------------
+RATES_ATTITUDE_MASK = (
+    mavutil.mavlink.ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE
+)
+
 VELOCITY_ONLY_MASK = (
     mavutil.mavlink.POSITION_TARGET_TYPEMASK_X_IGNORE |
     mavutil.mavlink.POSITION_TARGET_TYPEMASK_Y_IGNORE |
@@ -113,13 +106,11 @@ VELOCITY_ONLY_MASK = (
     mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE |
     mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE |
     mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_IGNORE
-    # Note: NOT ignoring YAW_RATE — we use it for heading control
 )
 
-# Mask for attitude-rate control (fallback)
-RATES_ATTITUDE_MASK = (
-    mavutil.mavlink.ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE
-)
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
 
 
 class Controller:
@@ -129,53 +120,46 @@ class Controller:
         self.system_boot_ms = system_boot_ms
 
         # State machine
-        self.state = STATE_IDLE
+        self.state = STATE_ARMED_WAIT
         self.state_start_time = time.time()
 
-        # Navigation state
-        self.target_gate_index = 0
-        self.gates = []
-        self.num_gates = 0
+        # Vision tracking
+        self.last_gate_seen_time = 0        # wall-clock time when gate last detected
+        self.last_gate_px_err = (0.0, 0.0)  # last known pixel error for momentum
+        self.search_direction = 1.0          # +1 or -1 for yaw search direction
 
-        # Recovery
-        self.recovery_start = 0
+        # Gate tracking
+        self.last_active_gate = 0
+        self.gates_passed = 0
 
-        # Timing
+        # Status printing
         self.last_print_time = 0
         self.loop_count = 0
 
-        # Startup delay — give time for telemetry to arrive
-        self.startup_time = time.time()
-
-        print("[CTRL] Controller initialized. Waiting for data...", flush=True)
+        print(f"[CTRL] Controller initialized. Control mode: {CONTROL_MODE}", flush=True)
 
     def update(self):
-        """Main control loop tick — called at CONTROL_HZ."""
+        """Main control tick."""
         self.loop_count += 1
         now = time.time()
+        elapsed = now - self.state_start_time
 
-        # ---------------------------------------------------------------
-        # STATE MACHINE
-        # ---------------------------------------------------------------
-        if self.state == STATE_IDLE:
-            self._handle_idle()
+        if self.state == STATE_ARMED_WAIT:
+            if elapsed > ARMED_WAIT_TIME:
+                print("[CTRL] Arm wait complete.", flush=True)
+                self._change_state(STATE_LIFTOFF)
+            # Do nothing while waiting
 
-        elif self.state == STATE_WAIT_FOR_DATA:
-            self._handle_wait_for_data()
-
-        elif self.state == STATE_TAKEOFF:
-            self._handle_takeoff()
+        elif self.state == STATE_LIFTOFF:
+            self._handle_liftoff(elapsed)
 
         elif self.state == STATE_NAVIGATE:
             self._handle_navigate()
 
-        elif self.state == STATE_RECOVER:
-            self._handle_recover()
-
         elif self.state == STATE_FINISHED:
             self._handle_finished()
 
-        # Periodic status print
+        # Periodic status
         if now - self.last_print_time > 3.0:
             self._print_status()
             self.last_print_time = now
@@ -186,56 +170,34 @@ class Controller:
     # STATE HANDLERS
     # ===================================================================
 
-    def _handle_idle(self):
-        """Wait briefly, then move to data acquisition."""
-        if time.time() - self.startup_time > 1.0:
-            self._change_state(STATE_WAIT_FOR_DATA)
+    def _handle_liftoff(self, elapsed):
+        """Timed ascent — no position check needed."""
+        if elapsed > LIFTOFF_DURATION:
+            print(f"[CTRL] Liftoff complete ({LIFTOFF_DURATION}s). Starting navigation!", flush=True)
+            self._change_state(STATE_NAVIGATE)
+            return
 
-    def _handle_wait_for_data(self):
-        """Wait until we have position data and track data, then take off."""
-        has_pos = self.data.get('has_position', False)
-        track_received = self.data.get('track', {}).get('received', False)
+        if CONTROL_MODE == "attitude":
+            # Thrust up, keep level
+            att = self.data.get('attitude', {})
+            pitch = att.get('pitch', 0.0)
+            roll = att.get('roll', 0.0)
 
-        elapsed = time.time() - self.state_start_time
+            # Level corrections
+            pitch_rate = KP_PITCH * (0.0 - pitch)  # target level
+            roll_rate = KP_ROLL * (0.0 - roll)
 
-        # Print waiting status every 2 seconds
-        if int(elapsed) % 2 == 0 and elapsed > 0.5:
-            if not has_pos:
-                if self.loop_count % 100 == 0:
-                    print(f"[CTRL] Waiting for position data... ({elapsed:.0f}s)", flush=True)
-
-        if has_pos:
-            if track_received:
-                self._load_track_data()
-                self._change_state(STATE_TAKEOFF)
-            elif elapsed > 10.0:
-                # Track data might not come — proceed anyway with vision-only
-                print("[CTRL] No track data received — proceeding with vision-only navigation", flush=True)
-                self._change_state(STATE_TAKEOFF)
-
-    def _handle_takeoff(self):
-        """Ascend to flight altitude."""
-        pos = self.data.get('local_position', {})
-        current_z = pos.get('z', 0.0)  # NED: negative = up
-
-        elapsed = time.time() - self.state_start_time
-
-        if current_z > TAKEOFF_ALT + ALT_TOLERANCE:
-            # Still need to go up (in NED, going up = more negative z)
-            self._send_velocity_ned(0.0, 0.0, -TAKEOFF_SPEED, 0.0)
+            self._send_attitude(roll_rate, pitch_rate, 0.0, LIFTOFF_THRUST)
         else:
-            # At altitude — hover briefly then start navigating
-            if elapsed > 2.0:
-                print(f"[CTRL] Takeoff complete at z={current_z:.2f}m. Starting navigation!", flush=True)
-                self._change_state(STATE_NAVIGATE)
-            else:
-                # Hover
-                self._send_velocity_ned(0.0, 0.0, 0.0, 0.0)
+            # Velocity: go up
+            self._send_velocity_ned(0.0, 0.0, -1.5, 0.0)
 
     def _handle_navigate(self):
         """
-        Main navigation logic — fly through gates sequentially.
-        Uses waypoint navigation with optional vision refinement.
+        Main navigation — steer toward gates using vision.
+
+        When gate visible: steer toward it.
+        When gate NOT visible: fly forward + search yaw.
         """
         # Check race status
         race = self.data.get('race_status', {})
@@ -243,310 +205,288 @@ class Controller:
             self._change_state(STATE_FINISHED)
             return
 
-        # Update target gate from race status
-        race_gate_idx = race.get('active_gate_index', 0)
-        if race_gate_idx > self.target_gate_index:
-            self.target_gate_index = race_gate_idx
+        # Track gate progress
+        active_gate = race.get('active_gate_index', 0)
+        if active_gate > self.last_active_gate:
+            self.gates_passed += 1
+            self.last_active_gate = active_gate
 
-        # Check for collisions — enter recovery if bad
-        collision = self.data.get('collision', {})
-        if collision.get('active', False):
-            col_time = collision.get('timestamp', 0)
-            if time.time() - col_time < 0.5:  # recent collision
-                threat = collision.get('threat_level', 0)
-                if threat >= 2:
-                    print(f"[CTRL] Heavy collision detected! Entering recovery...", flush=True)
-                    self._change_state(STATE_RECOVER)
-                    return
-                # Clear collision flag for light impacts
-                self.data['collision']['active'] = False
-
-        # Get drone position
-        pos = self.data.get('local_position', {})
-        drone_pos = np.array([pos.get('x', 0.0), pos.get('y', 0.0), pos.get('z', 0.0)])
-        drone_vel = np.array([pos.get('vx', 0.0), pos.get('vy', 0.0), pos.get('vz', 0.0)])
-
-        # Get drone yaw
+        # Get current attitude
         att = self.data.get('attitude', {})
-        drone_yaw = att.get('yaw', 0.0)
-
-        # Determine target
-        if self.num_gates > 0 and self.target_gate_index < self.num_gates:
-            gate = self.gates[self.target_gate_index]
-            gate_pos = np.array(gate['position'])
-            gate_ori = gate['orientation']  # (w, x, y, z)
-
-            # Compute gate forward direction
-            gate_forward = quat_forward_vector(*gate_ori)
-            gate_forward_2d = normalize(np.array([gate_forward[0], gate_forward[1], 0.0]))
-
-            # Aim point: slightly past the gate center along its forward direction
-            # This ensures we fly THROUGH the gate, not stop at it
-            aim_point = gate_pos + gate_forward_2d * GATE_LOOKAHEAD
-
-            # If there's a next gate, blend the aim direction toward it for smooth turns
-            if self.target_gate_index + 1 < self.num_gates:
-                next_gate_pos = np.array(self.gates[self.target_gate_index + 1]['position'])
-                # Direction from current gate to next gate
-                next_dir = normalize(next_gate_pos - gate_pos)
-                # Blend aim point when close to current gate
-                dist_to_gate = np.linalg.norm(gate_pos - drone_pos)
-                if dist_to_gate < APPROACH_DISTANCE:
-                    blend = 1.0 - (dist_to_gate / APPROACH_DISTANCE)
-                    blend = blend * 0.3  # subtle blending
-                    aim_point = aim_point + next_dir * blend * 3.0
-
-            # Vector from drone to aim point
-            to_target = aim_point - drone_pos
-            dist_to_gate = np.linalg.norm(gate_pos - drone_pos)
-            dist_to_aim = np.linalg.norm(to_target)
-            direction = normalize(to_target)
-
-            # Speed profile based on distance to gate
-            if dist_to_gate > FAR_DISTANCE:
-                target_speed = MAX_SPEED
-            elif dist_to_gate > APPROACH_DISTANCE:
-                # Linear interpolation
-                t = (dist_to_gate - APPROACH_DISTANCE) / (FAR_DISTANCE - APPROACH_DISTANCE)
-                target_speed = APPROACH_SPEED + t * (MAX_SPEED - APPROACH_SPEED)
-            elif dist_to_gate > PRECISION_DISTANCE:
-                t = (dist_to_gate - PRECISION_DISTANCE) / (APPROACH_DISTANCE - PRECISION_DISTANCE)
-                target_speed = PRECISION_SPEED + t * (APPROACH_SPEED - PRECISION_SPEED)
-            else:
-                target_speed = PRECISION_SPEED
-
-            # Compute velocity command
-            vel_cmd = direction * target_speed
-
-            # Vision refinement — apply corrections from gate detector
-            vision = self.data.get('vision_detection', None)
-            if vision is not None and vision.get('detected', False):
-                vis_dist = vision.get('distance', 999)
-                if vis_dist < VISION_BLEND_DISTANCE and dist_to_gate < VISION_BLEND_DISTANCE:
-                    pixel_err = vision.get('pixel_error', (0, 0))
-                    # Convert pixel error to lateral/vertical correction in body frame
-                    # pixel_error = (horizontal_error, vertical_error)
-                    # Positive horizontal error = gate is to the right
-                    # Positive vertical error = gate is below center
-
-                    # Weight increases as we get closer
-                    t = 1.0 - (dist_to_gate / VISION_BLEND_DISTANCE)
-                    weight = t * VISION_WEIGHT_MAX
-
-                    # Apply corrections in the drone's local frame
-                    # Horizontal correction → lateral velocity (NED Y for right)
-                    # Vertical correction → altitude velocity (NED Z for down)
-                    cos_yaw = math.cos(drone_yaw)
-                    sin_yaw = math.sin(drone_yaw)
-
-                    # Lateral correction in NED frame
-                    lat_correction = pixel_err[0] * VISION_PIXEL_GAIN * weight
-                    # Vertical correction in NED (positive pixel error = gate below = we need to go down)
-                    vert_correction = pixel_err[1] * VISION_PIXEL_GAIN * weight
-
-                    vel_cmd[0] += -sin_yaw * lat_correction
-                    vel_cmd[1] += cos_yaw * lat_correction
-                    vel_cmd[2] += vert_correction
-
-            # Yaw rate: point toward the gate
-            desired_yaw = math.atan2(to_target[1], to_target[0])
-            yaw_error = desired_yaw - drone_yaw
-            # Wrap to [-pi, pi]
-            while yaw_error > math.pi:
-                yaw_error -= 2 * math.pi
-            while yaw_error < -math.pi:
-                yaw_error += 2 * math.pi
-            yaw_rate = clamp(yaw_error * 2.0, -2.0, 2.0)  # P-controller for yaw
-
-            # Clamp total velocity magnitude
-            speed = np.linalg.norm(vel_cmd)
-            if speed > MAX_SPEED:
-                vel_cmd = vel_cmd / speed * MAX_SPEED
-
-            self._send_velocity_ned(vel_cmd[0], vel_cmd[1], vel_cmd[2], yaw_rate)
-
-        elif self.num_gates == 0:
-            # No track data — use vision-only navigation
-            self._navigate_vision_only(drone_yaw)
-
-        else:
-            # All gates completed
-            print("[CTRL] All gates completed! Hovering...", flush=True)
-            self._send_velocity_ned(0.0, 0.0, 0.0, 0.0)
-            self._change_state(STATE_FINISHED)
-
-    def _navigate_vision_only(self, drone_yaw):
-        """
-        Fallback navigation using only vision detection.
-        Fly toward detected gate, or search if no gate visible.
-        """
-        vision = self.data.get('vision_detection', None)
-
-        if vision is not None and vision.get('detected', False):
-            tvec = vision.get('tvec_body_ned', None)
-            if tvec is not None:
-                # Gate detected — fly toward it
-                direction = normalize(tvec)
-                distance = np.linalg.norm(tvec)
-
-                if distance > FAR_DISTANCE:
-                    speed = MAX_SPEED
-                elif distance > APPROACH_DISTANCE:
-                    speed = APPROACH_SPEED
-                else:
-                    speed = PRECISION_SPEED
-
-                vel = direction * speed
-
-                # Yaw toward the gate
-                desired_yaw = math.atan2(tvec[1], tvec[0]) + drone_yaw
-                yaw_error = desired_yaw - drone_yaw
-                while yaw_error > math.pi:
-                    yaw_error -= 2 * math.pi
-                while yaw_error < -math.pi:
-                    yaw_error += 2 * math.pi
-                yaw_rate = clamp(yaw_error * 2.0, -2.0, 2.0)
-
-                # Transform body velocity to NED
-                cos_y = math.cos(drone_yaw)
-                sin_y = math.sin(drone_yaw)
-                vx_ned = cos_y * vel[0] - sin_y * vel[1]
-                vy_ned = sin_y * vel[0] + cos_y * vel[1]
-                vz_ned = vel[2]
-
-                self._send_velocity_ned(vx_ned, vy_ned, vz_ned, yaw_rate)
-                return
-
-        # No gate visible — search pattern: fly forward slowly, slight yaw to scan
-        search_speed = 2.0
-        cos_y = math.cos(drone_yaw)
-        sin_y = math.sin(drone_yaw)
-        self._send_velocity_ned(
-            cos_y * search_speed,
-            sin_y * search_speed,
-            0.0,
-            0.3  # slow yaw to scan
-        )
-
-    def _handle_recover(self):
-        """Back up briefly after a collision, then resume navigation."""
-        elapsed = time.time() - self.state_start_time
-
-        if elapsed > RECOVERY_DURATION:
-            self.data['collision']['active'] = False
-            print("[CTRL] Recovery complete, resuming navigation.", flush=True)
-            self._change_state(STATE_NAVIGATE)
-            return
-
-        # Back up and go up slightly
-        att = self.data.get('attitude', {})
+        pitch = att.get('pitch', 0.0)
+        roll = att.get('roll', 0.0)
         yaw = att.get('yaw', 0.0)
+
+        # Get vision detection
+        vision = self.data.get('vision_detection', {})
+        detection_time = vision.get('timestamp', 0)
+        is_fresh = (time.time() - detection_time) < 0.5  # less than 500ms old
+        gate_visible = vision.get('detected', False) and is_fresh
+
+        now = time.time()
+
+        if gate_visible:
+            self.last_gate_seen_time = now
+            px_err = vision.get('pixel_error', (0.0, 0.0))
+            self.last_gate_px_err = px_err
+            gate_area = vision.get('gate_area', 0)
+            distance = vision.get('distance', None)
+
+            if CONTROL_MODE == "attitude":
+                self._navigate_attitude_gate_visible(pitch, roll, yaw, px_err, gate_area, distance)
+            else:
+                self._navigate_velocity_gate_visible(yaw, px_err, gate_area, distance)
+        else:
+            time_since_gate = now - self.last_gate_seen_time
+
+            if CONTROL_MODE == "attitude":
+                self._navigate_attitude_no_gate(pitch, roll, yaw, time_since_gate)
+            else:
+                self._navigate_velocity_no_gate(yaw, time_since_gate)
+
+    def _handle_finished(self):
+        """Race done — hover."""
+        if CONTROL_MODE == "attitude":
+            att = self.data.get('attitude', {})
+            pitch_rate = KP_PITCH * (0.0 - att.get('pitch', 0.0))
+            roll_rate = KP_ROLL * (0.0 - att.get('roll', 0.0))
+            self._send_attitude(roll_rate, pitch_rate, 0.0, HOVER_THRUST)
+        else:
+            self._send_velocity_ned(0.0, 0.0, 0.0, 0.0)
+
+    # ===================================================================
+    # ATTITUDE CONTROL NAVIGATION
+    # ===================================================================
+
+    def _navigate_attitude_gate_visible(self, pitch, roll, yaw, px_err, gate_area, distance):
+        """
+        Gate is visible — steer toward it using attitude control.
+
+        px_err = (horizontal_error, vertical_error) in pixels
+          Positive horizontal = gate is to the RIGHT of image center
+          Positive vertical = gate is BELOW image center
+        """
+        ex, ey = px_err
+
+        # --- YAW RATE ---
+        # Turn toward the gate horizontally
+        yaw_rate = KP_YAW_PIXEL * ex
+        yaw_rate = clamp(yaw_rate, -1.5, 1.5)
+
+        # --- DESIRED ROLL ---
+        # Slight roll into the turn for lateral correction
+        desired_roll = KP_ROLL_PIXEL * ex
+        desired_roll = clamp(desired_roll, -MAX_ROLL, MAX_ROLL)
+
+        # --- DESIRED PITCH ---
+        # Base forward pitch + slight correction from vertical error
+        # If gate is below center (positive ey), we might be too high → pitch forward more
+        # If gate is above center (negative ey), we might be too low → pitch less forward
+        desired_pitch = FORWARD_PITCH - KP_PITCH_PIXEL * ey
+        desired_pitch = clamp(desired_pitch, MAX_PITCH, 0.0)
+
+        # Slow down when very close to gate
+        if distance is not None and distance < SLOW_DOWN_DISTANCE:
+            slowdown = SLOW_DOWN_FACTOR + (1.0 - SLOW_DOWN_FACTOR) * (distance / SLOW_DOWN_DISTANCE)
+            desired_pitch *= slowdown
+
+        # --- THRUST ---
+        # Base hover + vertical correction
+        # Gate above center (negative ey) → need more thrust to go up
+        # Gate below center (positive ey) → need less thrust
+        thrust = HOVER_THRUST - KP_THRUST_PIXEL * ey
+        thrust = clamp(thrust, 0.35, 0.75)
+
+        # --- CONVERT DESIRED ANGLES → RATE COMMANDS ---
+        pitch_rate = KP_PITCH * (desired_pitch - pitch)
+        roll_rate = KP_ROLL * (desired_roll - roll)
+
+        pitch_rate = clamp(pitch_rate, -2.0, 2.0)
+        roll_rate = clamp(roll_rate, -2.0, 2.0)
+
+        self._send_attitude(roll_rate, pitch_rate, yaw_rate, thrust)
+
+    def _navigate_attitude_no_gate(self, pitch, roll, yaw, time_since_gate):
+        """
+        No gate visible — fly forward and search.
+        
+        Strategy:
+        - Brief momentum: continue last known direction for ~1s
+        - Then: fly forward with gentle yaw sweep to find next gate
+        """
+        if time_since_gate < 1.0 and self.last_gate_seen_time > 0:
+            # Momentum phase: keep flying in last known direction briefly
+            ex, ey = self.last_gate_px_err
+            # Reduced corrections (fading)
+            fade = 1.0 - time_since_gate
+            yaw_rate = KP_YAW_PIXEL * ex * fade * 0.5
+            desired_roll = KP_ROLL_PIXEL * ex * fade * 0.3
+            desired_pitch = FORWARD_PITCH
+            thrust = HOVER_THRUST - KP_THRUST_PIXEL * ey * fade * 0.3
+        else:
+            # Search phase: fly forward with yaw sweep
+            desired_pitch = SEARCH_PITCH
+            desired_roll = 0.0
+            thrust = SEARCH_THRUST
+
+            # Yaw search — sweep back and forth
+            if time_since_gate > NO_GATE_TIMEOUT:
+                # More aggressive search
+                yaw_rate = SEARCH_YAW_RATE * self.search_direction * 1.5
+                # Flip direction every 3 seconds
+                if int(time_since_gate) % 6 < 3:
+                    self.search_direction = 1.0
+                else:
+                    self.search_direction = -1.0
+            else:
+                yaw_rate = SEARCH_YAW_RATE * self.search_direction * 0.5
+
+        desired_pitch = clamp(desired_pitch, MAX_PITCH, 0.0)
+        desired_roll = clamp(desired_roll, -MAX_ROLL, MAX_ROLL)
+        thrust = clamp(thrust, 0.35, 0.70)
+
+        pitch_rate = KP_PITCH * (desired_pitch - pitch)
+        roll_rate = KP_ROLL * (desired_roll - roll)
+
+        pitch_rate = clamp(pitch_rate, -2.0, 2.0)
+        roll_rate = clamp(roll_rate, -2.0, 2.0)
+        yaw_rate = clamp(yaw_rate, -1.5, 1.5)
+
+        self._send_attitude(roll_rate, pitch_rate, yaw_rate, thrust)
+
+    # ===================================================================
+    # VELOCITY CONTROL NAVIGATION (alternative mode)
+    # ===================================================================
+
+    def _navigate_velocity_gate_visible(self, yaw, px_err, gate_area, distance):
+        """Gate visible — fly toward it using velocity commands."""
+        ex, ey = px_err
         cos_y = math.cos(yaw)
         sin_y = math.sin(yaw)
 
-        # Reverse along current heading
-        self._send_velocity_ned(
-            cos_y * RECOVERY_SPEED,
-            sin_y * RECOVERY_SPEED,
-            -0.5,   # go up a bit
-            0.0
-        )
+        # Speed based on distance
+        if distance is not None:
+            if distance > 10:
+                speed = CRUISE_SPEED
+            elif distance > 5:
+                speed = APPROACH_SPEED
+            else:
+                speed = PRECISION_SPEED
+        else:
+            speed = APPROACH_SPEED
 
-    def _handle_finished(self):
-        """Race complete — hover in place."""
-        self._send_velocity_ned(0.0, 0.0, 0.0, 0.0)
+        # Lateral and vertical corrections (in body frame)
+        lateral = clamp(ex * 0.008, -2.0, 2.0)    # body-right
+        vertical = clamp(ey * 0.005, -1.5, 1.5)    # body-down
+
+        # Body velocities
+        vx_body = speed          # forward
+        vy_body = lateral        # right
+        vz_body = vertical       # down
+
+        # Transform body → NED
+        vx_ned = cos_y * vx_body - sin_y * vy_body
+        vy_ned = sin_y * vx_body + cos_y * vy_body
+        vz_ned = vz_body
+
+        # Yaw toward gate
+        yaw_rate = clamp(ex * KP_YAW_PIXEL, -1.5, 1.5)
+
+        self._send_velocity_ned(vx_ned, vy_ned, vz_ned, yaw_rate)
+
+    def _navigate_velocity_no_gate(self, yaw, time_since_gate):
+        """No gate visible — fly forward and search."""
+        cos_y = math.cos(yaw)
+        sin_y = math.sin(yaw)
+
+        speed = SEARCH_SPEED
+        vx_ned = cos_y * speed
+        vy_ned = sin_y * speed
+
+        if time_since_gate > NO_GATE_TIMEOUT:
+            yaw_rate = SEARCH_YAW_RATE * self.search_direction
+            if int(time_since_gate) % 6 < 3:
+                self.search_direction = 1.0
+            else:
+                self.search_direction = -1.0
+        else:
+            yaw_rate = 0.2 * self.search_direction
+
+        self._send_velocity_ned(vx_ned, vy_ned, 0.0, yaw_rate)
 
     # ===================================================================
     # COMMAND SENDERS
     # ===================================================================
 
-    def _send_velocity_ned(self, vx, vy, vz, yaw_rate):
-        """
-        Send velocity command in NED frame.
-        vx: North velocity (m/s)
-        vy: East velocity (m/s)
-        vz: Down velocity (m/s)
-        yaw_rate: yaw rate (rad/s)
-        """
+    def _send_attitude(self, roll_rate, pitch_rate, yaw_rate, thrust):
+        """Send attitude rate + thrust command."""
         now_ms = int(time.time() * 1000)
-
-        self.sim_conn.mav.set_position_target_local_ned_send(
-            now_ms - self.system_boot_ms,
-            self.sim_conn.target_system,
-            self.sim_conn.target_component,
-            mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-            VELOCITY_ONLY_MASK,
-            0.0, 0.0, 0.0,          # position (ignored)
-            float(vx), float(vy), float(vz),  # velocity
-            0.0, 0.0, 0.0,          # acceleration (ignored)
-            0.0,                     # yaw (ignored)
-            float(yaw_rate)          # yaw rate
-        )
-
-    def _send_attitude_rate(self, roll_rate, pitch_rate, yaw_rate, thrust):
-        """
-        Fallback: send attitude rate command.
-        """
-        now_ms = int(time.time() * 1000)
-
         self.sim_conn.mav.set_attitude_target_send(
             now_ms - self.system_boot_ms,
             self.sim_conn.target_system,
             self.sim_conn.target_component,
             RATES_ATTITUDE_MASK,
-            [1, 0, 0, 0],  # dummy quaternion (ignored)
+            [1, 0, 0, 0],      # dummy quaternion (ignored)
             float(roll_rate),
             float(pitch_rate),
             float(yaw_rate),
             float(thrust)
         )
 
+    def _send_velocity_ned(self, vx, vy, vz, yaw_rate):
+        """Send velocity command in NED frame."""
+        now_ms = int(time.time() * 1000)
+        self.sim_conn.mav.set_position_target_local_ned_send(
+            now_ms - self.system_boot_ms,
+            self.sim_conn.target_system,
+            self.sim_conn.target_component,
+            mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+            VELOCITY_ONLY_MASK,
+            0.0, 0.0, 0.0,
+            float(vx), float(vy), float(vz),
+            0.0, 0.0, 0.0,
+            0.0,
+            float(yaw_rate)
+        )
+
     # ===================================================================
     # HELPERS
     # ===================================================================
 
-    def _load_track_data(self):
-        """Load gate positions from track data."""
-        track = self.data.get('track', {})
-        self.gates = track.get('gates', [])
-        self.num_gates = track.get('num_gates', 0)
-        if self.num_gates > 0:
-            print(f"[CTRL] Loaded {self.num_gates} gates for navigation.", flush=True)
-
     def _change_state(self, new_state):
-        """Transition to a new state."""
         old = self.state
         self.state = new_state
         self.state_start_time = time.time()
         print(f"[CTRL] State: {old} → {new_state}", flush=True)
 
     def _print_status(self):
-        """Print periodic status update."""
-        pos = self.data.get('local_position', {})
         att = self.data.get('attitude', {})
         race = self.data.get('race_status', {})
+        track = self.data.get('track', {})
 
-        x, y, z = pos.get('x', 0), pos.get('y', 0), pos.get('z', 0)
-        vx, vy, vz = pos.get('vx', 0), pos.get('vy', 0), pos.get('vz', 0)
-        speed = math.sqrt(vx**2 + vy**2 + vz**2)
+        pitch_deg = math.degrees(att.get('pitch', 0))
+        roll_deg = math.degrees(att.get('roll', 0))
         yaw_deg = math.degrees(att.get('yaw', 0))
 
-        gate_idx = race.get('active_gate_index', self.target_gate_index)
+        active_gate = race.get('active_gate_index', 0)
+        num_gates = track.get('num_gates', '?')
 
-        status = (f"[STATUS] state={self.state} gate={gate_idx}/{self.num_gates} "
-                  f"pos=({x:.1f},{y:.1f},{z:.1f}) speed={speed:.1f}m/s yaw={yaw_deg:.0f}°")
+        vision = self.data.get('vision_detection', {})
+        det_time = vision.get('timestamp', 0)
+        is_fresh = (time.time() - det_time) < 0.5
+        gate_vis = vision.get('detected', False) and is_fresh
 
-        if self.num_gates > 0 and self.target_gate_index < self.num_gates:
-            gate_pos = np.array(self.gates[self.target_gate_index]['position'])
-            drone_pos = np.array([x, y, z])
-            dist = np.linalg.norm(gate_pos - drone_pos)
-            status += f" dist_to_gate={dist:.1f}m"
+        vis_str = "NO"
+        if gate_vis:
+            d = vision.get('distance', 0)
+            px = vision.get('pixel_error', (0, 0))
+            vis_str = f"YES(d={d:.1f}m px=({px[0]:.0f},{px[1]:.0f}))"
 
-        vision = self.data.get('vision_detection', None)
-        if vision and vision.get('detected', False):
-            status += f" vision=YES(d={vision.get('distance', 0):.1f}m)"
-        else:
-            status += " vision=NO"
+        since_gate = time.time() - self.last_gate_seen_time if self.last_gate_seen_time > 0 else 999
+
+        status = (f"[STATUS] state={self.state} gate={active_gate}/{num_gates} "
+                  f"pitch={pitch_deg:.1f}° roll={roll_deg:.1f}° yaw={yaw_deg:.0f}° "
+                  f"vision={vis_str} last_seen={since_gate:.1f}s ago")
 
         print(status, flush=True)
 
@@ -555,14 +495,12 @@ class Controller:
     # ===================================================================
 
     def arm(self):
-        """Arm the drone."""
         self.sim_conn.mav.command_long_send(
             self.sim_conn.target_system,
             self.sim_conn.target_component,
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             0,
-            1,  # arm
-            0, 0, 0, 0, 0, 0
+            1, 0, 0, 0, 0, 0, 0
         )
 
     def send_sim_reset_command(self):
@@ -570,6 +508,5 @@ class Controller:
             self.sim_conn.target_system,
             self.sim_conn.target_component,
             MAVLINK_CMD_SIM_RESET,
-            0,  # confirmation
-            0, 0, 0, 0, 0, 0, 0
+            0, 0, 0, 0, 0, 0, 0, 0
         )
