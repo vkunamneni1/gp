@@ -44,10 +44,6 @@ mavlink_rx = components['mavlink_rx']
 vision_rx = components['vision_rx']
 
 print("", flush=True)
-print("Arming drone...", flush=True)
-controller.arm()
-time.sleep(0.5)  # brief delay to let arm command process
-
 print("Starting autonomous control loop...", flush=True)
 print("=" * 60, flush=True)
 
