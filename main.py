@@ -46,7 +46,7 @@ vision_rx = components['vision_rx']
 print("", flush=True)
 print("Resetting simulator...", flush=True)
 controller.send_sim_reset_command()
-time.sleep(3.0)  # Wait for EKF to stabilize after teleport reset
+time.sleep(1.0)
 
 print("Starting autonomous control loop...", flush=True)
 print("=" * 60, flush=True)
