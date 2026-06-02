@@ -1,26 +1,26 @@
+"""
+Autonomous Flight Controller - Velocity Mode with Ground Holding
+==============================================================
+Fixes:
+1. Spams `arm()` while waiting for the race to start to prevent auto-disarm on the ground.
+2. Doesn't take off until the race officially starts to prevent drifting across the start line.
+3. Uses pure Velocity commands (no Angle mode spinning!).
+"""
+
 import time
 import math
 import numpy as np
 from pymavlink import mavutil
 
-# Ignore body rates, use attitude quaternion + thrust
-ATTITUDE_MODE_MASK = mavutil.mavlink.ATTITUDE_TARGET_TYPEMASK_BODY_ROLL_RATE_IGNORE | \
-                     mavutil.mavlink.ATTITUDE_TARGET_TYPEMASK_BODY_PITCH_RATE_IGNORE | \
-                     mavutil.mavlink.ATTITUDE_TARGET_TYPEMASK_BODY_YAW_RATE_IGNORE
-
-def euler_to_quat(roll, pitch, yaw):
-    cr = math.cos(roll * 0.5)
-    sr = math.sin(roll * 0.5)
-    cp = math.cos(pitch * 0.5)
-    sp = math.sin(pitch * 0.5)
-    cy = math.cos(yaw * 0.5)
-    sy = math.sin(yaw * 0.5)
-    
-    w = cr * cp * cy + sr * sp * sy
-    x = sr * cp * cy - cr * sp * sy
-    y = cr * sp * cy + sr * cp * sy
-    z = cr * cp * sy - sr * sp * cy
-    return [w, x, y, z]
+VELOCITY_ONLY_MASK = (
+    mavutil.mavlink.POSITION_TARGET_TYPEMASK_X_IGNORE |
+    mavutil.mavlink.POSITION_TARGET_TYPEMASK_Y_IGNORE |
+    mavutil.mavlink.POSITION_TARGET_TYPEMASK_Z_IGNORE |
+    mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE |
+    mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE |
+    mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE |
+    mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_IGNORE
+)
 
 class Controller:
     def __init__(self, sim_conn, data, system_boot_ms):
@@ -29,63 +29,55 @@ class Controller:
         self.system_boot_ms = system_boot_ms
         self.state = "WAIT_RACE"
         self.state_start = time.time()
-        self.start_yaw = None
-        print("[CTRL] ANGLE FLIGHT MODE SCRIPT INITIALIZED", flush=True)
+        self.last_arm_time = time.time()
+        print("[CTRL] VELOCITY CONTROLLER INITIALIZED. WAITING FOR RACE.", flush=True)
 
     def update(self):
         now = time.time()
-        
-        # Capture initial yaw to maintain heading
-        att = self.data.get('attitude', {})
-        current_yaw = att.get('yaw', 0.0)
-        if self.start_yaw is None:
-            self.start_yaw = current_yaw
 
         if self.state == "WAIT_RACE":
-            race = self.data.get('race_status', {})
-            if race.get('race_started', False):
+            race_started = self.data.get('race_status', {}).get('race_started', False)
+            if race_started:
                 print("[CTRL] RACE STARTED! TAKING OFF!", flush=True)
                 self.state = "TAKEOFF"
                 self.state_start = now
             else:
-                # Send 0 angle, tiny thrust to keep alive but not move
-                self._send_attitude(0.0, 0.0, self.start_yaw, 0.01)
+                # Spam arm command every 1 second to prevent auto-disarm while waiting
+                if now - self.last_arm_time > 1.0:
+                    self.arm()
+                    self.last_arm_time = now
                 if int(now * 10) % 20 == 0:
-                    print("[CTRL] Waiting for race start (Angle Mode)...", flush=True)
+                    print("[CTRL] Sitting on the ground waiting for countdown...", flush=True)
 
         elif self.state == "TAKEOFF":
-            # Send 0 angle, large thrust to climb
-            t_elapsed = now - self.state_start
-            if t_elapsed < 1.5:
-                self._send_attitude(0.0, 0.0, self.start_yaw, 0.8)
+            # Fly straight up until we reach 2m altitude
+            pos = self.data.get('local_position', {})
+            current_z = pos.get('z', 0.0) # negative is up
+            
+            if current_z > -2.0:
+                self._send_velocity_ned(0, 0, -3.0, 0)
             else:
-                print("[CTRL] MOVING FORWARD!", flush=True)
-                self.state = "MOVE_FORWARD"
+                print("[CTRL] Altitude reached! MOVING FORWARD!", flush=True)
+                self.state = "NAVIGATE"
 
-        elif self.state == "MOVE_FORWARD":
-            # Pitch down 20 degrees (0.35 rad) to fly forward, moderate thrust
-            self._send_attitude(0.0, 0.35, self.start_yaw, 0.6)
+        elif self.state == "NAVIGATE":
+            # Just fly straight forward for now to prove movement works safely!
+            self._send_velocity_ned(5.0, 0, 0, 0)
             if int(now * 10) % 20 == 0:
-                print("[CTRL] FLYING FORWARD! (Pitch 20deg)", flush=True)
+                print("[CTRL] FLYING FORWARD!", flush=True)
 
         time.sleep(0.02)
 
     def arm(self):
-        print("[CTRL] ARMING CALLED FROM MAIN!", flush=True)
         self.sim_conn.mav.command_long_send(
             self.sim_conn.target_system, self.sim_conn.target_component,
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0
         )
 
-    def _send_attitude(self, roll, pitch, yaw, thrust):
+    def _send_velocity_ned(self, vx, vy, vz, yaw_rate):
         now_ms = int(time.time() * 1000)
-        q = euler_to_quat(roll, pitch, yaw)
-        self.sim_conn.mav.set_attitude_target_send(
-            now_ms - self.system_boot_ms,
-            self.sim_conn.target_system,
-            self.sim_conn.target_component,
-            ATTITUDE_MODE_MASK,
-            q,
-            0, 0, 0, # Ignored rates
-            float(thrust)
+        self.sim_conn.mav.set_position_target_local_ned_send(
+            now_ms - self.system_boot_ms, self.sim_conn.target_system, self.sim_conn.target_component,
+            mavutil.mavlink.MAV_FRAME_LOCAL_NED, VELOCITY_ONLY_MASK,
+            0, 0, 0, float(vx), float(vy), float(vz), 0, 0, 0, 0, float(yaw_rate)
         )
