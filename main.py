@@ -44,9 +44,9 @@ mavlink_rx = components['mavlink_rx']
 vision_rx = components['vision_rx']
 
 print("", flush=True)
-print("Resetting simulator to clear any stuck states...", flush=True)
+print("Resetting simulator...", flush=True)
 controller.send_sim_reset_command()
-time.sleep(1.0)
+time.sleep(3.0)  # Wait for EKF to stabilize after teleport reset
 
 print("Starting autonomous control loop...", flush=True)
 print("=" * 60, flush=True)
