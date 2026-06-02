@@ -81,12 +81,6 @@ class Controller:
         now = time.time()
         elapsed = now - self.startup_time
 
-        # RC overrides to prevent failsafe (throttle=1000 = no RC throttle input)
-        self.sim_conn.mav.rc_channels_override_send(
-            self.sim_conn.target_system, self.sim_conn.target_component,
-            1500, 1500, 1000, 1500, 0, 0, 0, 0
-        )
-
         if self.state == "WAIT":
             race_started = self.data.get('race_status', {}).get('race_started', False)
             track_ready = self.data.get('track', {}).get('received', False)
@@ -149,30 +143,19 @@ class Controller:
         gate = self.gates[self.target_gate_idx]
         gate_pos = gate['position']
 
-        # Vector to gate in NED
+        # Fly toward gate at 3 m/s in NED
         to_gate = gate_pos - drone_pos
-        horiz_dist = math.sqrt(to_gate[0]**2 + to_gate[1]**2)
+        direction = normalize(to_gate)
+        vel_cmd = direction * 3.0
 
-        # Bearing to gate in NED
-        bearing = math.atan2(to_gate[1], to_gate[0])
+        # Yaw toward gate
+        desired_yaw = math.atan2(to_gate[1], to_gate[0])
+        yaw_err = desired_yaw - drone_yaw
+        while yaw_err > math.pi: yaw_err -= 2 * math.pi
+        while yaw_err < -math.pi: yaw_err += 2 * math.pi
+        yaw_rate = clamp(yaw_err * 1.0, -1.0, 1.0)
 
-        # Angle relative to drone's nose
-        relative_angle = bearing - drone_yaw
-        while relative_angle > math.pi: relative_angle -= 2 * math.pi
-        while relative_angle < -math.pi: relative_angle += 2 * math.pi
-
-        # Body-frame velocity (the FC uses body frame despite NED flag)
-        speed = 3.0
-        vx_body = speed * math.cos(relative_angle)  # forward/back
-        vy_body = speed * math.sin(relative_angle)  # right/left
-
-        # Vertical: proportional to altitude error, clamped
-        vz_body = clamp(to_gate[2] * 0.5, -2.0, 2.0)
-
-        # Yaw: turn nose toward gate
-        yaw_rate = clamp(relative_angle * 1.0, -1.0, 1.0)
-
-        self._send_velocity_ned(vx_body, vy_body, vz_body, yaw_rate)
+        self._send_velocity_ned(vel_cmd[0], vel_cmd[1], vel_cmd[2], yaw_rate)
 
     def _send_velocity_ned(self, vx, vy, vz, yaw_rate):
         self.last_cmd = (vx, vy, vz, yaw_rate)
