@@ -57,7 +57,6 @@ class Controller:
         self.system_boot_ms = system_boot_ms
         self.state = "WAIT"
         self.startup_time = time.time()
-        self.last_print_time = 0
         self.target_gate_idx = 0
         self.gates = []
         
@@ -128,10 +127,6 @@ class Controller:
 
         elif self.state == "NAVIGATE":
             self._handle_navigate()
-
-        if now - self.last_print_time > 1.0:
-            self._print_status()
-            self.last_print_time = now
 
         time.sleep(0.02)
 
@@ -220,21 +215,6 @@ class Controller:
             self.sim_conn.target_system, self.sim_conn.target_component,
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0
         )
-
-    def _print_status(self):
-        pos = self.data.get('local_position', {})
-        att = self.data.get('attitude', {})
-        x, y, z = pos.get('x', 0), pos.get('y', 0), pos.get('z', 0)
-        yaw_deg = math.degrees(att.get('yaw', 0))
-        
-        status = f"[STATUS] state={self.state} pos=({x:.1f},{y:.1f},{z:.1f}) yaw={yaw_deg:.0f}deg"
-        
-        if self.state == "NAVIGATE" and self.target_gate_idx < len(self.gates):
-            gate = self.gates[self.target_gate_idx]
-            gp = gate['pos']
-            status += f" | Gate={self.target_gate_idx} gpos=({gp[0]:.1f},{gp[1]:.1f},{gp[2]:.1f})"
-            
-        print(status, flush=True)
 
     def send_sim_reset_command(self):
         self.sim_conn.mav.command_long_send(
