@@ -100,6 +100,17 @@ class Controller:
                     print(f"[CTRL] Booting EKF & Sensors... {elapsed:.1f}s", flush=True)
             elif race_started and track_ready:
                 print(f"[CTRL] Race is ON and EKF is ready! Arming...", flush=True)
+                
+                # FORCE GUIDED MODE right before arming to ensure FC is ready to accept velocity commands
+                try:
+                    self.sim_conn.mav.set_mode_send(
+                        self.sim_conn.target_system,
+                        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                        4 # GUIDED
+                    )
+                except:
+                    pass
+                
                 self._load_track()
                 self.arm()
                 self.state = "ARMING"
