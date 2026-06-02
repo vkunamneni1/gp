@@ -50,7 +50,7 @@ GATE_PASSED_DIST   = 1.5    # consider gate passed if within this distance
 
 # Takeoff
 TAKEOFF_ALT   = -2.0      # NED: negative = up. 2m above ground.
-TAKEOFF_SPEED = 2.0        # m/s upward
+TAKEOFF_SPEED = 1.5        # m/s upward
 ALT_TOLERANCE = 0.5        # meters
 
 # Gate look-ahead: how far past the gate center to aim (to ensure clean pass-through)
@@ -242,8 +242,8 @@ class Controller:
         if elapsed < 1.0:
             self.arm()
 
-        # Time-based takeoff: go up for 3 seconds, then navigate
-        if elapsed < 3.0:
+        # Time-based takeoff: go up for 1.5 seconds, then navigate
+        if elapsed < 1.5:
             self._send_velocity_ned(0.0, 0.0, -TAKEOFF_SPEED, 0.0)
         else:
             pos = self.data.get('local_position', {})
@@ -494,14 +494,27 @@ class Controller:
     def _load_track_data(self):
         """Load gate positions from track data.
         
-        NOTE: The track data from mavlink_rx.py already comes in NED coordinates
-        (position_ned_x, position_ned_y, position_ned_z). No coordinate inversion needed.
+        IMPORTANT: The track data Z-axis uses POSITIVE-UP convention,
+        but our flight controller uses NED (Z-down = positive).
+        We MUST negate Z to convert. Evidence: gates go UP the course
+        with Z values 5.0, 13.6, 24.5 — these would be underground in NED.
         """
         track = self.data.get('track', {})
-        self.gates = track.get('gates', [])
+        raw_gates = track.get('gates', [])
         self.num_gates = track.get('num_gates', 0)
+        self.gates = []
+        for g in raw_gates:
+            pos = g['position']
+            converted = {
+                'id': g['id'],
+                'position': (pos[0], pos[1], -pos[2]),  # Negate Z: positive-up → NED
+                'orientation': g['orientation'],
+                'width': g['width'],
+                'height': g['height'],
+            }
+            self.gates.append(converted)
         if self.num_gates > 0:
-            print(f"[CTRL] Loaded {self.num_gates} gates for navigation.", flush=True)
+            print(f"[CTRL] Loaded {self.num_gates} gates (Z negated for NED).", flush=True)
             for i, g in enumerate(self.gates):
                 p = g['position']
                 print(f"  Gate {i}: pos=({p[0]:.1f}, {p[1]:.1f}, {p[2]:.1f})", flush=True)
