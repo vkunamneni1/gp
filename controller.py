@@ -31,6 +31,24 @@ class Controller:
         self.state_start = time.time()
         self.last_arm_time = time.time()
         print("[CTRL] VELOCITY CONTROLLER INITIALIZED. WAITING FOR RACE.", flush=True)
+        
+        # Force the flight controller back into GUIDED mode (fixes stuck ACRO mode)
+        try:
+            print("[CTRL] Forcing flight controller to GUIDED mode...", flush=True)
+            self.sim_conn.mav.set_mode_send(
+                self.sim_conn.target_system,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                4 # GUIDED mode in ArduPilot
+            )
+            # Also send via command_long as a fallback
+            self.sim_conn.mav.command_long_send(
+                self.sim_conn.target_system, self.sim_conn.target_component,
+                mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                4, 0, 0, 0, 0, 0
+            )
+        except Exception as e:
+            print(f"[CTRL] Mode set failed: {e}")
 
     def update(self):
         now = time.time()
