@@ -77,11 +77,13 @@ class Controller:
         gate_list = track.get('gates', [])
         self.gates = []
         for g in gate_list:
-            pos = np.array(g['position'])
+            # The simulator sends Z as UP, but our flight controller expects NED (Z is DOWN).
+            # We MUST invert Z to prevent the drone from diving into the ground!
+            pos = np.array([g['position'][0], g['position'][1], -g['position'][2]])
             q = g['orientation']
             fwd = quat_forward_vector(q[0], q[1], q[2], q[3])
             self.gates.append({'pos': pos, 'fwd': fwd})
-        print(f"[CTRL] Track loaded: {len(self.gates)} gates.", flush=True)
+        print(f"[CTRL] Track loaded: {len(self.gates)} gates (Z-inverted for NED).", flush=True)
 
     def update(self):
         now = time.time()
