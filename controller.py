@@ -93,8 +93,13 @@ class Controller:
             race_started = self.data.get('race_status', {}).get('race_started', False)
             track_ready = self.data.get('track', {}).get('received', False)
             
-            if race_started and track_ready:
-                print(f"[CTRL] Race is ON! Arming...", flush=True)
+            # FORCE a mandatory 4-second wait after boot to allow ArduPilot EKF to initialize!
+            # If we try to arm before EKF is ready, the flight controller silently rejects the arm command.
+            if elapsed < 4.0:
+                if int(now * 10) % 20 == 0:
+                    print(f"[CTRL] Booting EKF & Sensors... {elapsed:.1f}s", flush=True)
+            elif race_started and track_ready:
+                print(f"[CTRL] Race is ON and EKF is ready! Arming...", flush=True)
                 self._load_track()
                 self.arm()
                 self.state = "ARMING"
