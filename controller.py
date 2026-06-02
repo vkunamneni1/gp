@@ -57,8 +57,9 @@ class Controller:
         self.target_gate_idx = 0
         self.gates = []
         
-        print("[CTRL] AI Pilot Core Initialized. Awaiting race start...", flush=True)
+        print("[CTRL] Ultimate Bypass Script Initialized.", flush=True)
 
+        # Force GUIDED mode right at startup (like the GOOD script)
         try:
             self.sim_conn.mav.set_mode_send(
                 self.sim_conn.target_system,
@@ -83,7 +84,8 @@ class Controller:
         now = time.time()
         elapsed = now - self.startup_time
 
-        # Keep RC alive to block Failsafe
+        # Send RC Overrides continuously to prevent Throttle Failsafe / RC Loss timeout!
+        # This keeps the flight controller awake so it allows us to arm later.
         self.sim_conn.mav.rc_channels_override_send(
             self.sim_conn.target_system, self.sim_conn.target_component,
             1500, 1500, 1000, 1500, 0, 0, 0, 0
@@ -91,46 +93,31 @@ class Controller:
 
         if self.state == "WAIT":
             race_started = self.data.get('race_status', {}).get('race_started', False)
-            track_ready = self.data.get('track', {}).get('received', False)
-            
-            # FORCE a mandatory 4-second wait after boot to allow ArduPilot EKF to initialize!
-            # If we try to arm before EKF is ready, the flight controller silently rejects the arm command.
-            if elapsed < 4.0:
-                if int(now * 10) % 20 == 0:
-                    print(f"[CTRL] Booting EKF & Sensors... {elapsed:.1f}s", flush=True)
-            elif race_started and track_ready:
-                print(f"[CTRL] Race is ON and EKF is ready! Arming...", flush=True)
-                
-                # FORCE GUIDED MODE right before arming to ensure FC is ready to accept velocity commands
-                try:
-                    self.sim_conn.mav.set_mode_send(
-                        self.sim_conn.target_system,
-                        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-                        4 # GUIDED
-                    )
-                except:
-                    pass
-                
+            if race_started or elapsed > 5.0:
+                print(f"[CTRL] Race started (or 5s passed). Arming now!", flush=True)
                 self._load_track()
                 self.arm()
                 self.state = "ARMING"
                 self.takeoff_start = now
-            elif int(now * 10) % 20 == 0:
-                print(f"[CTRL] Waiting for countdown... {elapsed:.1f}s", flush=True)
+            else:
+                if int(now * 10) % 20 == 0:
+                    print(f"[CTRL] Waiting... {elapsed:.1f}s", flush=True)
 
         elif self.state == "ARMING":
+            # Spam arm() for 0.5 seconds to guarantee the UDP packet isn't dropped!
+            self.arm()
             if now - self.takeoff_start > 0.5:
-                print(f"[CTRL] Taking off!", flush=True)
+                print(f"[CTRL] Armed! Taking off!", flush=True)
                 self.state = "TAKEOFF"
+                self.takeoff_start = now
 
         elif self.state == "TAKEOFF":
-            pos = self.data.get('local_position', {})
-            current_z = pos.get('z', 0.0)
-            
-            if current_z > TAKEOFF_ALT:
-                self._send_velocity_ned(0, 0, -TAKEOFF_SPEED, 0)
+            # Use exact timing-based takeoff from the GOOD script to guarantee ascent!
+            t_elapsed = now - self.takeoff_start
+            if t_elapsed < 3.0:
+                self._send_velocity_ned(0, 0, -3.0, 0)
             else:
-                print(f"[CTRL] Reached altitude. Navigating track!", flush=True)
+                print(f"[CTRL] Altitude reached! Flying forward to Gate 0!", flush=True)
                 self.state = "NAVIGATE"
 
         elif self.state == "NAVIGATE":
@@ -166,7 +153,6 @@ class Controller:
         drone_yaw = att.get('yaw', 0.0)
 
         # 1. Base Waypoint Navigation
-        # Aim slightly past the gate to ensure we don't cut the corner too early
         aim_point = gate_pos + gate_fwd * GATE_LOOKAHEAD
         to_aim = aim_point - drone_pos
         dist_to_gate = np.linalg.norm(gate_pos - drone_pos)
@@ -190,29 +176,23 @@ class Controller:
         vision = self.data.get('vision_detection', {})
         if vision.get('detected', False) and dist_to_gate < VISION_BLEND_DIST:
             px_err = vision.get('pixel_error', (0, 0))
-            
-            # Weight increases as we get closer to the gate
             weight = 1.0 - (dist_to_gate / VISION_BLEND_DIST)
             weight = min(weight, MAX_VISION_WEIGHT)
 
             cos_yaw = math.cos(drone_yaw)
             sin_yaw = math.sin(drone_yaw)
 
-            # px_err[0] > 0 means gate is to our right -> move right (positive Y in body frame)
-            # px_err[1] > 0 means gate is below center -> move down (positive Z in body frame)
             lat_corr = px_err[0] * VISION_GAIN * weight
             vert_corr = px_err[1] * VISION_GAIN * weight
 
-            # Convert body-frame lateral correction to NED
             vel_cmd[0] += -sin_yaw * lat_corr
             vel_cmd[1] += cos_yaw * lat_corr
             vel_cmd[2] += vert_corr
 
         # 4. Heading Alignment
-        # Smoothly rotate yaw to point towards our velocity vector
         target_yaw = math.atan2(vel_cmd[1], vel_cmd[0])
         yaw_err = wrap_pi(target_yaw - drone_yaw)
-        yaw_rate = yaw_err * 2.0 # Proportional control for yaw
+        yaw_rate = yaw_err * 2.0
 
         self._send_velocity_ned(vel_cmd[0], vel_cmd[1], vel_cmd[2], yaw_rate)
 
