@@ -99,15 +99,28 @@ class Controller:
 
         if self.state == "WAIT":
             race_started = self.data.get('race_status', {}).get('race_started', False)
-            if race_started or elapsed > 5.0:
-                print(f"[CTRL] Race started (or 5s passed). Arming now!", flush=True)
+            
+            # STRICT EKF BOOT DELAY:
+            # We MUST wait at least 4.0 seconds after SIM_RESET before arming, 
+            # even if the race has already started! Otherwise the EKF diverges into space.
+            if elapsed < 4.0:
+                if int(now * 10) % 20 == 0:
+                    print(f"[CTRL] Booting EKF... {elapsed:.1f}s", flush=True)
+            elif race_started:
+                print(f"[CTRL] EKF Ready & Race ON. Forcing GUIDED mode and Arming!", flush=True)
+                # Force GUIDED right before arming to guarantee we aren't stuck in ACRO
+                try:
+                    self.sim_conn.mav.set_mode_send(
+                        self.sim_conn.target_system,
+                        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                        4 # GUIDED
+                    )
+                except:
+                    pass
+                
                 self._load_track()
-                self.arm()
                 self.state = "ARMING"
                 self.takeoff_start = now
-            else:
-                if int(now * 10) % 20 == 0:
-                    print(f"[CTRL] Waiting... {elapsed:.1f}s", flush=True)
 
         elif self.state == "ARMING":
             # Spam arm() for 0.5 seconds to guarantee the UDP packet isn't dropped!
@@ -164,6 +177,11 @@ class Controller:
 
         # 1. Base Waypoint Navigation
         aim_point = gate_pos + gate_fwd * GATE_LOOKAHEAD
+        
+        # NEVER aim into the ground! If the gate is on the floor (Z=0), aim at least 1m above it.
+        # In NED, negative is UP. So we want aim_point[2] to be <= -1.0
+        aim_point[2] = min(aim_point[2], -1.0)
+        
         to_aim = aim_point - drone_pos
         dist_to_gate = np.linalg.norm(gate_pos - drone_pos)
         direction = normalize(to_aim)
@@ -212,6 +230,7 @@ class Controller:
         # Apply the throttling to our lateral/forward velocity
         vel_cmd[0] *= alignment_factor
         vel_cmd[1] *= alignment_factor
+        vel_cmd[2] *= alignment_factor
 
         self._send_velocity_ned(vel_cmd[0], vel_cmd[1], vel_cmd[2], yaw_rate)
 
