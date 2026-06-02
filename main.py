@@ -44,6 +44,10 @@ mavlink_rx = components['mavlink_rx']
 vision_rx = components['vision_rx']
 
 print("", flush=True)
+print("Resetting simulator to clear any stuck states...", flush=True)
+controller.send_sim_reset_command()
+time.sleep(1.0)
+
 print("Arming drone...", flush=True)
 controller.arm()
 time.sleep(0.5)  # brief delay to let arm command process
