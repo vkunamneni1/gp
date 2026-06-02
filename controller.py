@@ -148,8 +148,8 @@ class Controller:
             1500, 1500, 1000, 1500, 0, 0, 0, 0
         )
 
-        # Keep spamming GUIDED mode every tick to make sure it sticks
-        if self.state in (STATE_WAIT_FOR_DATA, STATE_TAKEOFF, STATE_NAVIGATE):
+        # Periodically re-send GUIDED mode (1Hz, not every tick)
+        if self.loop_count % 50 == 0 and self.state in (STATE_WAIT_FOR_DATA, STATE_TAKEOFF, STATE_NAVIGATE):
             try:
                 self.sim_conn.mav.set_mode_send(
                     self.sim_conn.target_system,
@@ -253,10 +253,9 @@ class Controller:
 
     def _handle_navigate(self):
         """
-        Main navigation logic — fly through gates sequentially.
-        Uses waypoint navigation with optional vision refinement.
+        SIMPLIFIED navigation: just fly toward the gate center at constant speed.
+        No vision, no lookahead, no blending. Pure waypoint tracking.
         """
-        # Check race status
         race = self.data.get('race_status', {})
         if race.get('race_finished', False):
             self._change_state(STATE_FINISHED)
@@ -268,120 +267,42 @@ class Controller:
             print(f"[CTRL] Gate {self.target_gate_index} cleared! Now targeting gate {race_gate_idx}", flush=True)
             self.target_gate_index = race_gate_idx
 
-        # Check for collisions — enter recovery if bad
-        collision = self.data.get('collision', {})
-        if collision.get('active', False):
-            col_time = collision.get('timestamp', 0)
-            if time.time() - col_time < 0.5:  # recent collision
-                threat = collision.get('threat_level', 0)
-                if threat >= 2:
-                    print(f"[CTRL] Heavy collision detected! Entering recovery...", flush=True)
-                    self._change_state(STATE_RECOVER)
-                    return
-                # Clear collision flag for light impacts
-                self.data['collision']['active'] = False
+        if self.target_gate_index >= self.num_gates:
+            self._send_velocity_ned(0.0, 0.0, 0.0, 0.0)
+            return
 
-        # Get drone position
+        # Get drone state
         pos = self.data.get('local_position', {})
         drone_pos = np.array([pos.get('x', 0.0), pos.get('y', 0.0), pos.get('z', 0.0)])
-
-        # Get drone yaw
         att = self.data.get('attitude', {})
         drone_yaw = att.get('yaw', 0.0)
 
-        # Determine target
-        if self.num_gates > 0 and self.target_gate_index < self.num_gates:
-            gate = self.gates[self.target_gate_index]
-            gate_pos = np.array(gate['position'])
-            gate_ori = gate['orientation']  # (w, x, y, z)
+        # Get gate position
+        gate = self.gates[self.target_gate_index]
+        gate_pos = np.array(gate['position'])
 
-            # Compute gate forward direction
-            gate_forward = quat_forward_vector(*gate_ori)
-            gate_forward_2d = normalize(np.array([gate_forward[0], gate_forward[1], 0.0]))
+        # Simple: fly toward gate center
+        to_gate = gate_pos - drone_pos
+        dist = np.linalg.norm(to_gate)
+        direction = normalize(to_gate)
 
-            # Aim point: slightly past the gate center along its forward direction
-            # This ensures we fly THROUGH the gate, not stop at it
-            aim_point = gate_pos + gate_forward_2d * GATE_LOOKAHEAD
+        # Constant speed
+        speed = 3.0
+        if dist < 3.0:
+            speed = 2.0
 
-            # If there's a next gate, blend the aim direction toward it for smooth turns
-            if self.target_gate_index + 1 < self.num_gates:
-                next_gate_pos = np.array(self.gates[self.target_gate_index + 1]['position'])
-                next_dir = normalize(next_gate_pos - gate_pos)
-                dist_to_gate = np.linalg.norm(gate_pos - drone_pos)
-                if dist_to_gate < APPROACH_DISTANCE:
-                    blend = 1.0 - (dist_to_gate / APPROACH_DISTANCE)
-                    blend = blend * 0.3  # subtle blending
-                    aim_point = aim_point + next_dir * blend * 3.0
+        vel_cmd = direction * speed
 
-            # Vector from drone to aim point
-            to_target = aim_point - drone_pos
-            dist_to_gate = np.linalg.norm(gate_pos - drone_pos)
-            direction = normalize(to_target)
+        # Point nose at gate (yaw P-controller)
+        desired_yaw = math.atan2(to_gate[1], to_gate[0])
+        yaw_error = desired_yaw - drone_yaw
+        while yaw_error > math.pi:
+            yaw_error -= 2 * math.pi
+        while yaw_error < -math.pi:
+            yaw_error += 2 * math.pi
+        yaw_rate = clamp(yaw_error * 1.0, -1.0, 1.0)
 
-            # Speed profile based on distance to gate
-            if dist_to_gate > FAR_DISTANCE:
-                target_speed = MAX_SPEED
-            elif dist_to_gate > APPROACH_DISTANCE:
-                t = (dist_to_gate - APPROACH_DISTANCE) / (FAR_DISTANCE - APPROACH_DISTANCE)
-                target_speed = APPROACH_SPEED + t * (MAX_SPEED - APPROACH_SPEED)
-            elif dist_to_gate > PRECISION_DISTANCE:
-                t = (dist_to_gate - PRECISION_DISTANCE) / (APPROACH_DISTANCE - PRECISION_DISTANCE)
-                target_speed = PRECISION_SPEED + t * (APPROACH_SPEED - PRECISION_SPEED)
-            else:
-                target_speed = PRECISION_SPEED
-
-            # Compute velocity command
-            vel_cmd = direction * target_speed
-
-            # Vision refinement — apply corrections from gate detector
-            vision = self.data.get('vision_detection', None)
-            if vision is not None and vision.get('detected', False):
-                vis_dist = vision.get('distance', 999)
-                if vis_dist < VISION_BLEND_DISTANCE and dist_to_gate < VISION_BLEND_DISTANCE:
-                    pixel_err = vision.get('pixel_error', (0, 0))
-
-                    # Weight increases as we get closer
-                    t = 1.0 - (dist_to_gate / VISION_BLEND_DISTANCE)
-                    weight = t * VISION_WEIGHT_MAX
-
-                    cos_yaw = math.cos(drone_yaw)
-                    sin_yaw = math.sin(drone_yaw)
-
-                    # Lateral correction in NED frame
-                    lat_correction = pixel_err[0] * VISION_PIXEL_GAIN * weight
-                    # Vertical correction in NED
-                    vert_correction = pixel_err[1] * VISION_PIXEL_GAIN * weight
-
-                    vel_cmd[0] += -sin_yaw * lat_correction
-                    vel_cmd[1] += cos_yaw * lat_correction
-                    vel_cmd[2] += vert_correction
-
-            # Yaw rate: point toward the aim point
-            desired_yaw = math.atan2(to_target[1], to_target[0])
-            yaw_error = desired_yaw - drone_yaw
-            # Wrap to [-pi, pi]
-            while yaw_error > math.pi:
-                yaw_error -= 2 * math.pi
-            while yaw_error < -math.pi:
-                yaw_error += 2 * math.pi
-            yaw_rate = clamp(yaw_error * 2.0, -2.0, 2.0)  # P-controller for yaw
-
-            # Clamp total velocity magnitude
-            speed = np.linalg.norm(vel_cmd)
-            if speed > MAX_SPEED:
-                vel_cmd = vel_cmd / speed * MAX_SPEED
-
-            self._send_velocity_ned(vel_cmd[0], vel_cmd[1], vel_cmd[2], yaw_rate)
-
-        elif self.num_gates == 0:
-            # No track data — use vision-only navigation
-            self._navigate_vision_only(drone_yaw)
-
-        else:
-            # All gates completed
-            print("[CTRL] All gates completed! Hovering...", flush=True)
-            self._send_velocity_ned(0.0, 0.0, 0.0, 0.0)
-            self._change_state(STATE_FINISHED)
+        self._send_velocity_ned(vel_cmd[0], vel_cmd[1], vel_cmd[2], yaw_rate)
 
     def _navigate_vision_only(self, drone_yaw):
         """
