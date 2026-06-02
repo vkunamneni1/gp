@@ -194,10 +194,11 @@ class Controller:
             vel_cmd[1] += cos_yaw * lat_corr
             vel_cmd[2] += vert_corr
 
-        # 4. Heading Alignment
-        target_yaw = math.atan2(vel_cmd[1], vel_cmd[0])
+        # 4. Heading Alignment (Use stable to_aim, NOT the vision-perturbed vel_cmd!)
+        target_yaw = math.atan2(to_aim[1], to_aim[0])
         yaw_err = wrap_pi(target_yaw - drone_yaw)
-        yaw_rate = clamp(yaw_err * 2.0, -2.0, 2.0)
+        # Use a gentler P-gain to prevent yaw wobble
+        yaw_rate = clamp(yaw_err * 0.7, -1.0, 1.0)
 
         self._send_velocity_ned(vel_cmd[0], vel_cmd[1], vel_cmd[2], yaw_rate)
 
