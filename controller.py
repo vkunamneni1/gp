@@ -50,7 +50,7 @@ GATE_PASSED_DIST   = 1.5    # consider gate passed if within this distance
 
 # Takeoff
 TAKEOFF_ALT   = -2.0      # NED: negative = up. 2m above ground.
-TAKEOFF_SPEED = 1.0        # m/s upward
+TAKEOFF_SPEED = 2.0        # m/s upward
 ALT_TOLERANCE = 0.5        # meters
 
 # Gate look-ahead: how far past the gate center to aim (to ensure clean pass-through)
@@ -139,12 +139,25 @@ class Controller:
         self.loop_count += 1
         now = time.time()
 
-        # Send RC overrides to prevent RC-loss failsafe
-        # (The simulator expects RC input or it triggers failsafe)
+        # Send RC overrides to prevent RC-loss failsafe.
+        # CRITICAL: Throttle (ch3) MUST be 1000, not 1500.
+        # 1500 = mid-throttle = "hover command" that fights our velocity commands.
+        # 1000 = no throttle input = velocity commands have full authority.
         self.sim_conn.mav.rc_channels_override_send(
             self.sim_conn.target_system, self.sim_conn.target_component,
-            1500, 1500, 1500, 1500, 0, 0, 0, 0
+            1500, 1500, 1000, 1500, 0, 0, 0, 0
         )
+
+        # Keep spamming GUIDED mode every tick to make sure it sticks
+        if self.state in (STATE_WAIT_FOR_DATA, STATE_TAKEOFF, STATE_NAVIGATE):
+            try:
+                self.sim_conn.mav.set_mode_send(
+                    self.sim_conn.target_system,
+                    mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                    4  # GUIDED
+                )
+            except Exception:
+                pass
 
         # ---------------------------------------------------------------
         # STATE MACHINE
@@ -222,27 +235,21 @@ class Controller:
             self._change_state(STATE_TAKEOFF)
 
     def _handle_takeoff(self):
-        """Ascend to flight altitude."""
-        pos = self.data.get('local_position', {})
-        current_z = pos.get('z', 0.0)  # NED: negative = up
-
+        """Ascend to flight altitude using time-based approach."""
         elapsed = time.time() - self.state_start_time
 
-        # Keep trying to arm during early takeoff if not armed yet
+        # Keep spamming arm during first second in case packets were dropped
         if elapsed < 1.0:
             self.arm()
 
-        if current_z > TAKEOFF_ALT + ALT_TOLERANCE:
-            # Still need to go up (in NED, going up = more negative z)
+        # Time-based takeoff: go up for 3 seconds, then navigate
+        if elapsed < 3.0:
             self._send_velocity_ned(0.0, 0.0, -TAKEOFF_SPEED, 0.0)
         else:
-            # At altitude — hover briefly then start navigating
-            if elapsed > 2.0:
-                print(f"[CTRL] Takeoff complete at z={current_z:.2f}m. Starting navigation!", flush=True)
-                self._change_state(STATE_NAVIGATE)
-            else:
-                # Hover at altitude
-                self._send_velocity_ned(0.0, 0.0, 0.0, 0.0)
+            pos = self.data.get('local_position', {})
+            current_z = pos.get('z', 0.0)
+            print(f"[CTRL] Takeoff complete at z={current_z:.2f}m. Starting navigation!", flush=True)
+            self._change_state(STATE_NAVIGATE)
 
     def _handle_navigate(self):
         """
