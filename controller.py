@@ -20,15 +20,14 @@ class Controller:
         self.system_boot_ms = system_boot_ms
         self.startup_time = time.time()
         self.state = "WAIT"
-        print("[CTRL] SIMPLIFIED CONTROLLER: WAITING 5 SECONDS...", flush=True)
+        print("[CTRL] MINIMAL SCRIPT. WAITING 5 SECONDS ON GROUND...", flush=True)
 
     def update(self):
         elapsed = time.time() - self.startup_time
 
         if self.state == "WAIT":
             if elapsed > 5.0:
-                print("[CTRL] 5 SECONDS PASSED. ARMING NOW!", flush=True)
-                self.arm()
+                print("[CTRL] 5 SECONDS PASSED. TAKING OFF NOW!", flush=True)
                 self.state = "TAKEOFF"
                 self.takeoff_start = time.time()
             else:
@@ -36,12 +35,9 @@ class Controller:
                     print(f"[CTRL] Waiting... {5.0 - elapsed:.1f}s", flush=True)
 
         elif self.state == "TAKEOFF":
-            # Wait 1 second for arm to process, then go UP
+            # Go UP for 3 seconds
             t_elapsed = time.time() - self.takeoff_start
-            if t_elapsed < 1.0:
-                pass # let arm process
-            elif t_elapsed < 4.0:
-                print("[CTRL] TAKING OFF! (vz = -3.0)", flush=True)
+            if t_elapsed < 3.0:
                 self._send_velocity_ned(0.0, 0.0, -3.0, 0.0)
             else:
                 self.state = "MOVE_FORWARD"
@@ -53,6 +49,7 @@ class Controller:
         time.sleep(0.02) # 50Hz
 
     def arm(self):
+        print("[CTRL] ARMING CALLED FROM MAIN!", flush=True)
         self.sim_conn.mav.command_long_send(
             self.sim_conn.target_system, self.sim_conn.target_component,
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0
