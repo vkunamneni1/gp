@@ -148,16 +148,8 @@ class Controller:
             1500, 1500, 1000, 1500, 0, 0, 0, 0
         )
 
-        # Periodically re-send GUIDED mode (1Hz, not every tick)
-        if self.loop_count % 50 == 0 and self.state in (STATE_WAIT_FOR_DATA, STATE_TAKEOFF, STATE_NAVIGATE):
-            try:
-                self.sim_conn.mav.set_mode_send(
-                    self.sim_conn.target_system,
-                    mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-                    4  # GUIDED
-                )
-            except Exception:
-                pass
+
+
 
         # ---------------------------------------------------------------
         # STATE MACHINE
@@ -195,15 +187,6 @@ class Controller:
         """Wait for EKF to stabilize after SIM_RESET, then move to data acquisition."""
         elapsed = time.time() - self.startup_time
         if elapsed > 3.0:
-            # Force GUIDED mode before we do anything
-            try:
-                self.sim_conn.mav.set_mode_send(
-                    self.sim_conn.target_system,
-                    mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-                    4  # GUIDED
-                )
-            except Exception:
-                pass
             self._change_state(STATE_WAIT_FOR_DATA)
         elif self.loop_count % 100 == 0:
             print(f"[CTRL] Waiting for EKF stabilization... {elapsed:.1f}s", flush=True)
