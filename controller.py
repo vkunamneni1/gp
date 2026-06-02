@@ -40,6 +40,9 @@ def normalize(v):
 def wrap_pi(angle):
     return (angle + math.pi) % (2 * math.pi) - math.pi
 
+def clamp(value, min_val, max_val):
+    return max(min_val, min(max_val, value))
+
 def quat_forward_vector(qw, qx, qy, qz):
     # Rotates unit-X by quaternion to get forward vector in NED
     fx = 1.0 - 2.0*(qy*qy + qz*qz)
@@ -192,7 +195,7 @@ class Controller:
         # 4. Heading Alignment
         target_yaw = math.atan2(vel_cmd[1], vel_cmd[0])
         yaw_err = wrap_pi(target_yaw - drone_yaw)
-        yaw_rate = yaw_err * 2.0
+        yaw_rate = clamp(yaw_err * 2.0, -2.0, 2.0)
 
         self._send_velocity_ned(vel_cmd[0], vel_cmd[1], vel_cmd[2], yaw_rate)
 
