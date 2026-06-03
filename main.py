@@ -46,7 +46,7 @@ vision_rx = components['vision_rx']
 print("", flush=True)
 print("Resetting simulator...", flush=True)
 controller.send_sim_reset_command()
-time.sleep(1.0)
+time.sleep(3.0)  # EKF needs time to stabilize after SIM_RESET before control loop
 
 print("Starting autonomous control loop...", flush=True)
 print("=" * 60, flush=True)

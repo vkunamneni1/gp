@@ -114,6 +114,9 @@ class GateDetector:
             'distance': None,
         }
 
+        if image is None or getattr(image, 'size', 0) == 0:
+            return result
+
         try:
             hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         except Exception:
@@ -262,8 +265,9 @@ class GateDetector:
 
         # If no single contour worked, try combining nearby contours
         if best_center is None:
-            # Filter contours with minimum area
             valid = [c for c in contours[:10] if cv2.contourArea(c) > 80]
+            if not valid:
+                return None, 0, None
             if len(valid) >= 2:
                 try:
                     all_points = np.vstack(valid)

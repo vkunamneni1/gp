@@ -2,137 +2,109 @@
 
 ## Overview
 
-This project is an autonomous drone racing controller for the **AI Grand Prix Simulator v1.0.3364**. It uses Python + MAVLink (pymavlink) to control a simulated quadcopter running ArduPilot inside a Unity-based 3D physics environment.
+Autonomous drone racing controller for **AI Grand Prix Simulator v1.0.3364**. Python + MAVLink (pymavlink) controls ArduPilot inside the Unity simulator.
 
-The drone navigates through a series of 3D gates using:
-1. **Global waypoint navigation** — Gate positions in NED coordinates from track data
-2. **Computer vision refinement** — OpenCV-based gate detection from FPV camera for precision threading
+Navigation:
+1. **Waypoint navigation** — Gate positions from track data (Z inverted for NED)
+2. **Vision refinement** — OpenCV gate detection when within 8m (optional blend)
 
 ---
 
 ## Architecture
 
-### Files
-
 | File | Purpose |
 |------|---------|
-| `main.py` | Entry point. Connects to sim, sends `SIM_RESET`, runs control loop |
-| `controller.py` | State machine: IDLE → WAIT_FOR_DATA → TAKEOFF → NAVIGATE → RECOVER → FINISHED |
-| `setup.py` | Wires up all components (MAVLink connection, receivers, controller) |
-| `mavlink_rx.py` | Background thread parsing MAVLink UDP telemetry into `shared_data` dict |
-| `vision_rx.py` | Background thread receiving FPV JPEG frames, running gate detection |
-| `gate_detector.py` | OpenCV gate detection via HSV color segmentation + solvePnP |
-| `timesync.py` | MAVLink time synchronization |
+| `main.py` | Connect, `SIM_RESET`, 3s wait, control loop |
+| `controller.py` | WAIT → ARMING → TAKEOFF (timer) → NAVIGATE → FINISHED |
+| `setup.py` | Wires MAVLink, vision, controller |
+| `mavlink_rx.py` | Telemetry → `shared_data` |
+| `vision_rx.py` | FPV frames → gate detector (errors must not crash thread) |
+| `gate_detector.py` | HSV + contours + solvePnP |
 
-### Data Flow
+---
 
-```
-Simulator (Unity)
-    ├─ UDP 14550 ──→ mavlink_rx.py ──→ shared_data (position, attitude, race_status, track, collision)
-    └─ UDP 5600  ──→ vision_rx.py ──→ shared_data['vision_detection']
+## Coordinate System (CRITICAL)
 
-controller.py reads shared_data, sends MAVLink velocity commands back via UDP 14550
-```
+**Flight controller uses NED:** X=North, Y=East, Z=Down (negative Z = up).
 
-### State Machine
+**Track gate Z from simulator is altitude-UP**, not true NED — despite `mavlink_rx.py` calling it `position_ned_z`. Gate 1 at raw Z=+5.1 means 5.1m above gate 0, not underground.
 
-```
-IDLE (3s EKF wait)
-  → WAIT_FOR_DATA (wait for position + track telemetry, then arm)
-    → TAKEOFF (ascend to -2.0m NED using velocity, altitude-checked)
-      → NAVIGATE (waypoint + vision blend, gate-by-gate)
-        → RECOVER (on heavy collision: back up 1s)
-          → NAVIGATE
-        → FINISHED (race_finished flag → hover)
+**Always invert track Z when loading gates:**
+```python
+pos = np.array([raw[0], raw[1], -raw[2]])
 ```
 
----
-
-## Coordinate System
-
-**All coordinates are NED (North-East-Down):**
-- X = North (positive forward)
-- Y = East (positive right)  
-- Z = Down (positive down, **negative = up**)
-
-The track data from `mavlink_rx.py` is **already in NED** (see line 308: `position_ned_x, position_ned_y, position_ned_z`). **No coordinate inversion is needed.**
-
-> [!CAUTION]
-> The previous agent incorrectly assumed the simulator sent Z-up coordinates and added a `-Z` inversion in `_load_track()`. This was **wrong** — the track data comments explicitly say NED. The inversion was removed.
+**Aim altitude floor:** `aim_point[2] = min(aim_point[2], -1.0)` so the drone never dives at ground-level gate centers (Z=0 raw).
 
 ---
 
-## Known Issues & Fixes Applied
+## Startup Sequence (proven)
 
-### 1. SIM_RESET + EKF Stabilization
-- `main.py` sends `SIM_RESET` (cmd 31000) on startup to teleport the drone to the start line
-- ArduPilot's EKF needs time to recalibrate after this teleport
-- **Fix:** `main.py` waits 3.0s after reset, then the controller's IDLE state waits another 3.0s before transitioning
+1. `main.py` sends `SIM_RESET` (cmd 31000), waits **3.0 seconds**
+2. Control loop starts; controller **WAIT** state:
+   - Mandatory **4.0s** EKF boot delay after script start (`Booting EKF...`)
+   - Then when `race_started` **or** `track.received`: force **GUIDED** mode once, load track, arm
+3. **ARMING:** spam `arm()` for 0.5s (UDP packet loss)
+4. **TAKEOFF:** **timer only** — `vz = -2.5` for **2.5s** — **never** use altitude telemetry here (stays 0,0,0 after reset → infinite climb)
+5. **NAVIGATE:** NED velocity toward gate aim point
 
-### 2. RC Failsafe
-- The simulator triggers an RC-loss failsafe if it doesn't receive RC channel overrides
-- **Fix:** `controller.update()` sends `rc_channels_override_send()` every tick (50 Hz) with centered sticks and mid-throttle
+### DO NOT use
 
-### 3. Flight Mode
-- The drone must be in GUIDED mode to accept `SET_POSITION_TARGET_LOCAL_NED` velocity commands
-- **Fix:** Controller forces GUIDED mode (custom_mode=4) during IDLE→WAIT_FOR_DATA transition
-
-### 4. UDP Packet Loss on Arm
-- Single `arm()` commands can be dropped over UDP
-- **Fix:** Controller sends `arm()` 5 times in quick succession, plus continues arming during early takeoff
-
----
-
-## Tuning Parameters (in controller.py)
-
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| `MAX_SPEED` | 6.0 m/s | Cruise speed on long straights |
-| `APPROACH_SPEED` | 3.5 m/s | Near gate |
-| `PRECISION_SPEED` | 2.5 m/s | Very close to gate |
-| `TAKEOFF_ALT` | -2.0 m | Target altitude (NED) |
-| `TAKEOFF_SPEED` | 1.0 m/s | Ascent rate |
-| `GATE_LOOKAHEAD` | 2.5 m | Aim past gate center for clean pass-through |
-| `VISION_BLEND_DISTANCE` | 8.0 m | Start trusting vision within this range |
-| `VISION_WEIGHT_MAX` | 0.3 | Max vision correction weight |
-| `VISION_PIXEL_GAIN` | 0.003 | Pixel error → velocity multiplier |
+| Anti-pattern | Why |
+|--------------|-----|
+| `rc_channels_override_send` | Hijacks throttle; FC ignores velocity commands |
+| Body-frame velocity hacks | Wrong; use `MAV_FRAME_LOCAL_NED` |
+| `set_mode` spam every tick | Unnecessary |
+| Attitude/ACRO takeoff | Sticks ACRO mode, breaks velocity control |
+| Altitude-based takeoff after SIM_RESET | Position stuck at z=0 → climb forever, no forward |
 
 ---
 
-## Navigation Logic (in `_handle_navigate`)
+## Navigation
 
-1. **Aim point calculation:** `gate_pos + gate_forward_2d * GATE_LOOKAHEAD`
-2. **Next-gate blending:** When close to current gate, subtly blend aim toward next gate
-3. **Speed profile:** Distance-based linear interpolation between MAX/APPROACH/PRECISION speeds
-4. **Vision correction:** When gate detected and within blend distance, apply pixel error as lateral/vertical velocity correction in NED frame
-5. **Yaw control:** P-controller with gain=2.0, clamped to ±2.0 rad/s
-6. **Speed clamping:** Total velocity vector magnitude capped at MAX_SPEED
+- Aim: `gate_pos + gate_forward * 1.5m`, altitude floor -1.0 NED
+- Speed: 6 / 3.5 / 2.5 m/s by distance
+- Yaw: P-gain 0.7, clamp ±1.0 rad/s from **`to_aim`** (not vision-adjusted velocity)
+- Alignment throttle: `vel_cmd *= max(0.1, cos(yaw_err))` on **all 3 axes**
+- Vision blend: ≤30% weight within 8m
 
 ---
 
-## Gate Detector (gate_detector.py)
+## Status logging
 
-- HSV color segmentation with auto-locking (tries all colors, locks after 8 consistent detections)
-- Contour analysis with aspect ratio filtering
-- Distance estimation via gate area or solvePnP when 4 corners detected
-- Camera: 640×360, fx=fy=320, 20° upward tilt
+Every 0.5s: `[STATUS] state armed pos speed yaw cmd=(vx,vy,vz,yaw_rate) gate dist`
+
+After TAKEOFF, `cmd` must show **non-zero vx/vy** toward gate 0 (~-23m North).
 
 ---
 
 ## Running
 
-```bash
-cd PyAIPilotExample
-python main.py
-```
-
-Requirements: `pymavlink`, `numpy`, `opencv-python` (see `requirements.txt`)
+1. **Restart FlightSim** (clears stuck ACRO from old tests)
+2. Start race in simulator
+3. `cd PyAIPilotExample && pip install -r requirements.txt && python main.py`
 
 ---
 
-## What Still Needs Testing
+## Troubleshooting
 
-1. **Does it actually take off and fly?** — The previous agent's broken Z-inversion and various patches made it impossible to verify. This clean version restores the original proven architecture. Run it and observe.
-2. **Gate transitions** — Does the drone smoothly move from gate to gate?
-3. **Vision accuracy** — Is the gate detector reliably finding gates in this environment?
-4. **Speed tuning** — Once gates are being cleared, optimize speeds for better lap times.
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| Flies up only, no forward | Altitude takeoff + stale z=0 | Use timer takeoff (current controller) |
+| Dives / spins on navigate | Track Z not inverted | `-raw[2]` in `_load_track` |
+| pos jumps to z=-93 | Armed before EKF ready | Wait 4s + 3s reset |
+| cmd correct but no motion | RC overrides | Remove them |
+| Violent yaw spin | yaw_rate unclamped / vision yaw loop | clamp ±1.0, yaw from `to_aim` only |
+
+---
+
+## Tuning (controller.py)
+
+| Parameter | Value |
+|-----------|-------|
+| `EKF_BOOT_DELAY_S` | 4.0 |
+| `TAKEOFF_DURATION_S` | 2.5 |
+| `TAKEOFF_VZ` | -2.5 |
+| `MAX_SPEED` | 6.0 |
+| `GATE_LOOKAHEAD` | 1.5 |
+| `AIM_ALTITUDE_NED` | -1.0 |
